@@ -5,33 +5,85 @@ from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 from io import BytesIO
 import re
 
-st.title("Extraction tableaux PDF géotechnique")
-
-HEAD_PRESSIO = [
-    "Sondage", "Profondeur (m)", "PF (MPa)", "PL (MPa)", "EM (MPa)",
-    "Sigma HS (MPa)", "PL* (MPa)", "PF* (MPa)", "PL*/PF*", "EM/PL*"
-]
-
-HEAD_COMP = [
-    "Sondage", "Niveau d'échantillon (m)", "Formation",
-    "Résistance à la compression (MPa)"
-]
+st.title("Extraction intelligente des tableaux PDF géotechnique")
 
 def clean(v):
     if v is None:
         return ""
     return str(v).replace("\n", " ").strip()
 
-def is_number(v):
-    v = clean(v).replace(",", ".")
-    return bool(re.fullmatch(r"\d+(\.\d+)?", v))
+def norm(txt):
+    txt = clean(txt).lower()
+    txt = txt.replace("è", "e").replace("é", "e").replace("ê", "e")
+    txt = txt.replace("à", "a").replace("ç", "c")
+    return txt
+
+def detect_type(tableau):
+    texte = " ".join(norm(c) for row in tableau[:4] for c in row if c)
+
+    if "pressio" in texte or "pression limite" in texte or "module pressiometrique" in texte or " pl " in texte:
+        return "Pressiometrique"
+
+    if "compression" in texte or "resistance" in texte:
+        return "Compression_simple"
+
+    if "coord" in texte or (" x " in texte and " y " in texte):
+        return "Coordonnees"
+
+    if "lithologie" in texte or "formation" in texte or "nature" in texte:
+        return "Lithologie"
+
+    if "granulo" in texte or "tamis" in texte or "passant" in texte:
+        return "Granulometrie"
+
+    if "atterberg" in texte or "limite de liquidite" in texte or "ip" in texte:
+        return "Atterberg"
+
+    if "cbr" in texte or "ipi" in texte:
+        return "CBR_IPI"
+
+    return "Autre"
+
+def get_header(tableau):
+    for row in tableau:
+        row_clean = [clean(c) for c in row]
+        text = " ".join(row_clean).lower()
+        if any(word in text for word in ["sondage", "profondeur", "pression", "module", "resistance", "coord", "formation"]):
+            return row_clean
+    return [f"Colonne_{i+1}" for i in range(max(len(r) for r in tableau))]
+
+def same_header(h1, h2):
+    a = " ".join(norm(x) for x in h1)
+    b = " ".join(norm(x) for x in h2)
+    return a == b or len(set(a.split()) & set(b.split())) >= 2
+
+def clean_rows(tableau, header):
+    rows = []
+    for row in tableau:
+        row_clean = [clean(c) for c in row]
+        if not any(row_clean):
+            continue
+        if same_header(row_clean, header):
+            continue
+        rows.append(row_clean)
+    return rows
+
+def unique_sheet_name(name, existing):
+    base = name[:25]
+    final = base
+    i = 1
+    while final in existing:
+        i += 1
+        final = f"{base}_{i}"
+    existing.add(final)
+    return final
 
 def style_sheet(ws):
     thin = Border(
         left=Side(style="thin"), right=Side(style="thin"),
         top=Side(style="thin"), bottom=Side(style="thin")
     )
-    header_fill = PatternFill("solid", fgColor="9DC3E6")
+    fill = PatternFill("solid", fgColor="9DC3E6")
 
     for row in ws.iter_rows():
         for cell in row:
@@ -40,105 +92,77 @@ def style_sheet(ws):
 
     for cell in ws[1]:
         cell.font = Font(bold=True)
-        cell.fill = header_fill
+        cell.fill = fill
 
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
 
     for col in ws.columns:
         max_len = max(len(str(c.value)) if c.value else 0 for c in col)
-        ws.column_dimensions[col[0].column_letter].width = min(max_len + 3, 35)
-
-def extraire_pressio(pdf):
-    rows = []
-    sondage = ""
-
-    for page in pdf.pages:
-        text = page.extract_text() or ""
-        lines = text.splitlines()
-
-        for line in lines:
-            line = clean(line)
-
-            m = re.search(r"Sondage\s+(SP_[A-Za-z0-9]+)", line)
-            if m:
-                sondage = m.group(1)
-                continue
-
-            parts = line.split()
-            if sondage and len(parts) >= 9 and is_number(parts[0]):
-                nums = parts[:9]
-                rows.append([sondage] + nums)
-
-    return rows
-
-def extraire_compression(pdf):
-    rows = []
-    in_section = False
-    sondage = ""
-
-    for page in pdf.pages:
-        text = page.extract_text() or ""
-        lines = text.splitlines()
-
-        for line in lines:
-            line = clean(line)
-
-            if "compression simple" in line.lower():
-                in_section = True
-                continue
-
-            if in_section and ("conclusion" in line.lower() or "le directeur" in line.lower()):
-                in_section = False
-
-            if not in_section:
-                continue
-
-            m_sondage = re.match(r"^(SC_[A-Za-z0-9_]+)\s*(.*)", line)
-            if m_sondage:
-                sondage = m_sondage.group(1)
-                line = m_sondage.group(2).strip()
-
-            m = re.match(r"^(\d+[\.,]\d+\s*-\s*\d+[\.,]\d+)\s+(.+?)\s+(\d+[\.,]?\d*)$", line)
-            if sondage and m:
-                niveau = m.group(1)
-                formation = m.group(2)
-                resistance = m.group(3)
-                rows.append([sondage, niveau, formation, resistance])
-
-    return rows
+        ws.column_dimensions[col[0].column_letter].width = min(max_len + 3, 40)
 
 pdf_file = st.file_uploader("Importer le PDF", type=["pdf"])
 
 if pdf_file:
+    groupes = {}
+
     with pdfplumber.open(pdf_file) as pdf:
-        pressio_rows = extraire_pressio(pdf)
-        comp_rows = extraire_compression(pdf)
+        for page_num, page in enumerate(pdf.pages, start=1):
+            tableaux = page.extract_tables()
+
+            for tableau in tableaux:
+                if not tableau or len(tableau) < 2:
+                    continue
+
+                typ = detect_type(tableau)
+                header = get_header(tableau)
+                rows = clean_rows(tableau, header)
+
+                if not rows:
+                    continue
+
+                cle_trouvee = None
+
+                for cle, bloc in groupes.items():
+                    if bloc["type"] == typ and same_header(bloc["header"], header):
+                        cle_trouvee = cle
+                        break
+
+                if cle_trouvee is None:
+                    cle_trouvee = f"{typ}_{len(groupes)+1}"
+                    groupes[cle_trouvee] = {
+                        "type": typ,
+                        "header": header,
+                        "rows": []
+                    }
+
+                groupes[cle_trouvee]["rows"].extend(rows)
 
     wb = Workbook()
     wb.remove(wb.active)
 
-    ws1 = wb.create_sheet("Pressiometrique")
-    ws1.append(HEAD_PRESSIO)
-    for r in pressio_rows:
-        ws1.append(r)
-    style_sheet(ws1)
+    existing_names = set()
 
-    ws2 = wb.create_sheet("Compression_simple")
-    ws2.append(HEAD_COMP)
-    for r in comp_rows:
-        ws2.append(r)
-    style_sheet(ws2)
+    for cle, bloc in groupes.items():
+        sheet_name = unique_sheet_name(bloc["type"], existing_names)
+        ws = wb.create_sheet(sheet_name)
+
+        ws.append(bloc["header"])
+
+        for row in bloc["rows"]:
+            ws.append(row)
+
+        style_sheet(ws)
 
     output = BytesIO()
     wb.save(output)
     output.seek(0)
 
-    st.success(f"Extraction terminée : {len(pressio_rows)} lignes pressiométriques et {len(comp_rows)} lignes compression simple.")
+    st.success(f"{len(groupes)} tableaux homogènes détectés et organisés.")
 
     st.download_button(
         label="Télécharger Excel organisé",
         data=output,
-        file_name="extraction_geotech_propre.xlsx",
+        file_name="extraction_geotech_intelligente.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
