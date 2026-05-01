@@ -1,121 +1,144 @@
 import streamlit as st
 import pdfplumber
 from openpyxl import Workbook
-from openpyxl.styles import Border, Side, Font
+from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 from io import BytesIO
 import re
 
 st.title("Extraction tableaux PDF géotechnique")
 
-def detect_type(tableau):
-    texte = " ".join(str(cell).lower() for ligne in tableau[:3] for cell in ligne if cell)
+HEAD_PRESSIO = [
+    "Sondage", "Profondeur (m)", "PF (MPa)", "PL (MPa)", "EM (MPa)",
+    "Sigma HS (MPa)", "PL* (MPa)", "PF* (MPa)", "PL*/PF*", "EM/PL*"
+]
 
-    if "coord" in texte or ("x" in texte and "y" in texte):
-        return "Coordonnees"
-    elif "litho" in texte:
-        return "Lithologie"
-    elif "profondeur" in texte:
-        return "Couches"
-    elif "pressio" in texte or "pl" in texte or "em" in texte:
-        return "Pressiometrique"
-    else:
-        return "Autre"
+HEAD_COMP = [
+    "Sondage", "Niveau d'échantillon (m)", "Formation",
+    "Résistance à la compression (MPa)"
+]
 
-def extraire_xy(texte):
-    if not texte:
-        return "", ""
+def clean(v):
+    if v is None:
+        return ""
+    return str(v).replace("\n", " ").strip()
 
-    texte = str(texte).replace("\n", " ")
+def is_number(v):
+    v = clean(v).replace(",", ".")
+    return bool(re.fullmatch(r"\d+(\.\d+)?", v))
 
-    x = re.search(r"X\s*[:=]\s*([0-9\s]+[,.]?[0-9]*)", texte, re.IGNORECASE)
-    y = re.search(r"Y\s*[:=]\s*([0-9\s]+[,.]?[0-9]*)", texte, re.IGNORECASE)
+def style_sheet(ws):
+    thin = Border(
+        left=Side(style="thin"), right=Side(style="thin"),
+        top=Side(style="thin"), bottom=Side(style="thin")
+    )
+    header_fill = PatternFill("solid", fgColor="9DC3E6")
 
-    x_val = x.group(1).strip() if x else ""
-    y_val = y.group(1).strip() if y else ""
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.border = thin
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    return x_val, y_val
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
 
-def traiter_coordonnees(tableau):
-    lignes = []
-    lignes.append(["Sondage", "X", "Y"])
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
 
-    for ligne in tableau[1:]:
-        if len(ligne) >= 2:
-            sondage = ligne[0]
-            coord = ligne[1]
+    for col in ws.columns:
+        max_len = max(len(str(c.value)) if c.value else 0 for c in col)
+        ws.column_dimensions[col[0].column_letter].width = min(max_len + 3, 35)
 
-            x, y = extraire_xy(coord)
+def extraire_pressio(pdf):
+    rows = []
+    sondage = ""
 
-            if sondage and (x or y):
-                lignes.append([sondage, x, y])
+    for page in pdf.pages:
+        text = page.extract_text() or ""
+        lines = text.splitlines()
 
-    return lignes
+        for line in lines:
+            line = clean(line)
+
+            m = re.search(r"Sondage\s+(SP_[A-Za-z0-9]+)", line)
+            if m:
+                sondage = m.group(1)
+                continue
+
+            parts = line.split()
+            if sondage and len(parts) >= 9 and is_number(parts[0]):
+                nums = parts[:9]
+                rows.append([sondage] + nums)
+
+    return rows
+
+def extraire_compression(pdf):
+    rows = []
+    in_section = False
+    sondage = ""
+
+    for page in pdf.pages:
+        text = page.extract_text() or ""
+        lines = text.splitlines()
+
+        for line in lines:
+            line = clean(line)
+
+            if "compression simple" in line.lower():
+                in_section = True
+                continue
+
+            if in_section and ("conclusion" in line.lower() or "le directeur" in line.lower()):
+                in_section = False
+
+            if not in_section:
+                continue
+
+            m_sondage = re.match(r"^(SC_[A-Za-z0-9_]+)\s*(.*)", line)
+            if m_sondage:
+                sondage = m_sondage.group(1)
+                line = m_sondage.group(2).strip()
+
+            m = re.match(r"^(\d+[\.,]\d+\s*-\s*\d+[\.,]\d+)\s+(.+?)\s+(\d+[\.,]?\d*)$", line)
+            if sondage and m:
+                niveau = m.group(1)
+                formation = m.group(2)
+                resistance = m.group(3)
+                rows.append([sondage, niveau, formation, resistance])
+
+    return rows
 
 pdf_file = st.file_uploader("Importer le PDF", type=["pdf"])
 
 if pdf_file:
+    with pdfplumber.open(pdf_file) as pdf:
+        pressio_rows = extraire_pressio(pdf)
+        comp_rows = extraire_compression(pdf)
+
     wb = Workbook()
     wb.remove(wb.active)
 
-    data = {}
+    ws1 = wb.create_sheet("Pressiometrique")
+    ws1.append(HEAD_PRESSIO)
+    for r in pressio_rows:
+        ws1.append(r)
+    style_sheet(ws1)
 
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
-            tableaux = page.extract_tables()
-
-            for tableau in tableaux:
-                if tableau and len(tableau) > 1:
-                    typ = detect_type(tableau)
-
-                    if typ == "Coordonnees":
-                        lignes = traiter_coordonnees(tableau)
-                    else:
-                        lignes = tableau
-
-                    if typ not in data:
-                        data[typ] = []
-
-                    if not data[typ]:
-                        data[typ].extend(lignes)
-                    else:
-                        data[typ].extend(lignes[1:])
-
-    thin = Border(
-        left=Side(style="thin"),
-        right=Side(style="thin"),
-        top=Side(style="thin"),
-        bottom=Side(style="thin")
-    )
-
-    for typ, lignes in data.items():
-        ws = wb.create_sheet(title=typ)
-
-        for i, ligne in enumerate(lignes, start=1):
-            for j, val in enumerate(ligne, start=1):
-                cell = ws.cell(row=i, column=j)
-                cell.value = val
-                cell.border = thin
-
-                if i == 1:
-                    cell.font = Font(bold=True)
-
-        for col in ws.columns:
-            max_len = 0
-            col_letter = col[0].column_letter
-            for cell in col:
-                if cell.value:
-                    max_len = max(max_len, len(str(cell.value)))
-            ws.column_dimensions[col_letter].width = max_len + 3
+    ws2 = wb.create_sheet("Compression_simple")
+    ws2.append(HEAD_COMP)
+    for r in comp_rows:
+        ws2.append(r)
+    style_sheet(ws2)
 
     output = BytesIO()
     wb.save(output)
     output.seek(0)
 
-    st.success("Extraction terminée avec X et Y séparés")
+    st.success(f"Extraction terminée : {len(pressio_rows)} lignes pressiométriques et {len(comp_rows)} lignes compression simple.")
 
     st.download_button(
-        label="Télécharger Excel",
+        label="Télécharger Excel organisé",
         data=output,
-        file_name="tables_geotech_final.xlsx",
+        file_name="extraction_geotech_propre.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
