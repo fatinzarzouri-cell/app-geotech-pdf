@@ -2,9 +2,7 @@ import streamlit as st
 import camelot
 import pandas as pd
 from io import BytesIO
-import tempfile
-import os
-import re
+import tempfile, os, re
 
 st.title("Extraction tableaux PDF → Excel")
 
@@ -16,27 +14,70 @@ def clean(x):
     return str(x).replace("\n", " ").strip()
 
 def clean_df(df):
-    try:
-        df = df.map(clean)
-    except:
-        df = df.applymap(clean)
-
+    df = df.map(clean)
     df = df.loc[:, ~(df == "").all()]
     df = df[(df != "").any(axis=1)]
     return df.reset_index(drop=True)
 
-def is_header(row):
-    txt = " ".join(row).lower()
-    letters = len(re.findall(r"[a-zA-Zéèêàç]", txt))
-    digits = len(re.findall(r"\d", txt))
-    return letters > digits
+def is_fake_table(df):
+    text = " ".join(df.astype(str).values.flatten()).lower()
+    bad_words = ["maitre d", "marché", "marche", "date", "référence", "reference", "page", "rapport"]
+    good_words = ["sondage", "profondeur", "pression", "module", "résistance", "resistance", "formation"]
+    return sum(w in text for w in bad_words) >= 3 and sum(w in text for w in good_words) == 0
 
-def signature(header):
-    return " | ".join([clean(x).lower() for x in header])
+def find_header_rows(df):
+    rows = []
+    for i in range(min(5, len(df))):
+        txt = " ".join(df.iloc[i].tolist()).lower()
+        letters = len(re.findall(r"[a-zA-Zéèêàç]", txt))
+        digits = len(re.findall(r"\d", txt))
+        if letters > digits:
+            rows.append(i)
+    return rows if rows else [0]
 
-def safe_name(name):
-    name = re.sub(r"[\\/*?:\[\]]", "_", name)
-    return name[:31] if name else "Tableau"
+def make_header(df, header_rows):
+    ncols = df.shape[1]
+    header = []
+    for c in range(ncols):
+        parts = []
+        for r in header_rows:
+            val = clean(df.iat[r, c])
+            if val:
+                parts.append(val)
+        header.append(" ".join(parts).strip() or f"Colonne_{c+1}")
+    return header
+
+def norm_header(header):
+    txt = " | ".join(header).lower()
+    txt = txt.replace("é","e").replace("è","e").replace("ê","e").replace("à","a").replace("ç","c")
+    txt = re.sub(r"\s+", " ", txt)
+    txt = re.sub(r"[^a-z0-9|*/() ]", "", txt)
+    return txt.strip()
+
+def same_table(h1, h2):
+    return len(h1) == len(h2) and norm_header(h1) == norm_header(h2)
+
+def table_name(header, idx):
+    txt = norm_header(header)
+    if "pression" in txt or "pressio" in txt or ("pl" in txt and "em" in txt):
+        return "Pressiometrique"
+    if "compression" in txt or "resistance" in txt:
+        return "Compression_simple"
+    if "coord" in txt or (" x " in txt and " y " in txt):
+        return "Coordonnees"
+    if "lithologie" in txt or "formation" in txt:
+        return "Lithologie"
+    return f"Tableau_{idx}"
+
+def safe_sheet(name, used):
+    name = re.sub(r"[\\/*?:\[\]]", "_", name)[:31]
+    base = name
+    i = 1
+    while name in used:
+        i += 1
+        name = f"{base}_{i}"[:31]
+    used.add(name)
+    return name
 
 if pdf_file:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -45,72 +86,63 @@ if pdf_file:
 
     st.info("Extraction en cours...")
 
-    all_tables = []
+    tables = camelot.read_pdf(
+        pdf_path,
+        pages="all",
+        flavor="lattice",
+        line_scale=40
+    )
 
-    for flavor in ["lattice", "stream"]:
-        try:
-            tables = camelot.read_pdf(pdf_path, pages="all", flavor=flavor)
-            for t in tables:
-                df = clean_df(t.df)
-                if not df.empty and len(df) > 1:
-                    all_tables.append(df)
-        except:
-            pass
+    groups = []
 
-    groupes = {}
-    last_key_by_cols = {}
+    for t in tables:
+        df = clean_df(t.df)
 
-    for df in all_tables:
-        first_row = df.iloc[0].tolist()
-        nb_cols = len(first_row)
+        if df.empty or len(df) < 2:
+            continue
 
-        if is_header(first_row):
-            header = first_row
-            data = df.iloc[1:].values.tolist()
-            key = f"{nb_cols}_{signature(header)}"
+        if is_fake_table(df):
+            continue
 
-            if key not in groupes:
-                groupes[key] = {
-                    "header": header,
-                    "rows": []
-                }
+        header_rows = find_header_rows(df)
+        header = make_header(df, header_rows)
+        data_start = max(header_rows) + 1
+        data = df.iloc[data_start:].values.tolist()
 
-            groupes[key]["rows"].extend(data)
-            last_key_by_cols[nb_cols] = key
+        data = [
+            row for row in data
+            if any(clean(x) for x in row)
+        ]
 
+        if not data:
+            continue
+
+        found = None
+        for g in groups:
+            if same_table(g["header"], header):
+                found = g
+                break
+
+        if found is None:
+            groups.append({
+                "header": header,
+                "rows": data
+            })
         else:
-            if nb_cols in last_key_by_cols:
-                key = last_key_by_cols[nb_cols]
-                groupes[key]["rows"].extend(df.values.tolist())
-            else:
-                header = [f"Colonne_{i+1}" for i in range(nb_cols)]
-                key = f"{nb_cols}_sans_titre_{len(groupes)+1}"
-                groupes[key] = {
-                    "header": header,
-                    "rows": df.values.tolist()
-                }
-                last_key_by_cols[nb_cols] = key
+            found["rows"].extend(data)
 
     output = BytesIO()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         used = set()
-        compteur = 1
 
-        for key, g in groupes.items():
-            sheet_name = f"Tableau_{compteur}"
-            sheet_name = safe_name(sheet_name)
-
-            while sheet_name in used:
-                compteur += 1
-                sheet_name = safe_name(f"Tableau_{compteur}")
-
-            used.add(sheet_name)
+        for i, g in enumerate(groups, start=1):
+            name = safe_sheet(table_name(g["header"], i), used)
 
             final_df = pd.DataFrame(g["rows"], columns=g["header"])
-            final_df.to_excel(writer, sheet_name=sheet_name, index=False)
+            final_df.to_excel(writer, sheet_name=name, index=False)
 
-            ws = writer.book[sheet_name]
+            ws = writer.book[name]
             ws.freeze_panes = "A2"
             ws.auto_filter.ref = ws.dimensions
 
@@ -118,16 +150,14 @@ if pdf_file:
                 max_len = max(len(str(c.value)) if c.value else 0 for c in col)
                 ws.column_dimensions[col[0].column_letter].width = min(max_len + 3, 45)
 
-            compteur += 1
-
     output.seek(0)
 
-    st.success(f"{len(groupes)} tableaux fusionnés.")
+    st.success(f"{len(groups)} tableaux réels fusionnés.")
 
     st.download_button(
         "Télécharger Excel",
         data=output,
-        file_name="tableaux_fusionnes.xlsx",
+        file_name="tableaux_reels_fusionnes.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
