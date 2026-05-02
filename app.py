@@ -16,7 +16,7 @@ def clean_cell(x):
 
 # تنظيف dataframe
 def clean_df(df):
-    df = df.applymap(clean_cell)
+    df = df.map(clean_cell)
     df = df.dropna(how="all")
     df = df.loc[:, ~(df == "").all()]
     return df.reset_index(drop=True)
