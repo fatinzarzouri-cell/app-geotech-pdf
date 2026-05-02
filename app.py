@@ -6,64 +6,72 @@ import tempfile
 import os
 import re
 
-st.title("Extraction tableaux PDF géotechnique")
+st.title("Extraction intelligente des tableaux PDF")
 
-pdf_file = st.file_uploader("Importer le PDF", type=["pdf"])
-
+# تنظيف cellule
 def clean_cell(x):
     if pd.isna(x):
         return ""
     return str(x).replace("\n", " ").strip()
 
+# تنظيف dataframe
 def clean_df(df):
     df = df.applymap(clean_cell)
     df = df.dropna(how="all")
     df = df.loc[:, ~(df == "").all()]
     return df.reset_index(drop=True)
 
+# تحديد header
 def get_header(df):
-    # cherche la première ligne qui ressemble à un header
     for i in range(min(4, len(df))):
         txt = " ".join(df.iloc[i].astype(str)).lower()
-        if any(w in txt for w in ["sondage", "profondeur", "pression", "module", "résistance", "resistance", "coord"]):
+        if any(w in txt for w in [
+            "sondage", "profondeur", "pression",
+            "module", "résistance", "resistance", "coord"
+        ]):
             return i
     return 0
 
+# normalize header
 def normalize_header(header):
     txt = " ".join([str(x).lower().strip() for x in header])
     txt = re.sub(r"\s+", " ", txt)
     return txt
 
-def safe_sheet_name(name):
-    name = re.sub(r"[\[\]\:\*\?\/\\]", "_", name)
+# اسم feuille
+def safe_name(name):
+    name = re.sub(r"[\\/*?:\[\]]", "_", name)
     return name[:31]
 
-def detect_name(header_text):
-    h = header_text.lower()
+# detect type
+def detect_name(h):
+    h = h.lower()
 
-    if "pression" in h or "pressio" in h or "module pressiom" in h:
+    if "pression" in h or "pressio" in h:
         return "Pressiometrique"
-    if "compression" in h or "résistance" in h or "resistance" in h:
+    if "compression" in h or "résistance" in h:
         return "Compression_simple"
     if "coord" in h or (" x " in h and " y " in h):
         return "Coordonnees"
-    if "lithologie" in h or "formation" in h:
+    if "litho" in h or "formation" in h:
         return "Lithologie"
 
     return "Tableau"
 
+# upload
+pdf_file = st.file_uploader("Importer PDF", type=["pdf"])
+
 if pdf_file:
+
+    # save temp file
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(pdf_file.read())
         pdf_path = tmp.name
 
     st.info("Extraction en cours...")
 
-    tables = camelot.read_pdf(
-        pdf_path,
-        pages="all",
-        flavor="lattice"
-    )
+    # extraction camelot
+    tables = camelot.read_pdf(pdf_path, pages="all", flavor="lattice")
 
     groupes = {}
 
@@ -75,16 +83,17 @@ if pdf_file:
 
         header_index = get_header(df)
         header = list(df.iloc[header_index])
-        data = df.iloc[header_index + 1:].copy()
+        data = df.iloc[header_index + 1:]
 
-        # supprimer les répétitions du header dans les pages suivantes
         header_norm = normalize_header(header)
+
         rows_clean = []
 
         for _, row in data.iterrows():
             row_list = list(row)
             row_norm = normalize_header(row_list)
 
+            # skip header duplicate
             if row_norm == header_norm:
                 continue
 
@@ -97,48 +106,51 @@ if pdf_file:
             continue
 
         key = f"{len(header)}__{header_norm}"
-        nom_base = detect_name(header_norm)
+        nom = detect_name(header_norm)
 
         if key not in groupes:
             groupes[key] = {
-                "nom": nom_base,
+                "nom": nom,
                 "header": header,
                 "rows": []
             }
 
-        groupes[key]["rows"]..extend(rows_clean)
+        groupes[key]["rows"].extend(rows_clean)
 
+    # export Excel
     output = BytesIO()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        used_names = {}
 
-        for key, g in groupes.items():
+        used = {}
+
+        for g in groupes.values():
+
             nom = g["nom"]
 
-            if nom in used_names:
-                used_names[nom] += 1
-                nom_sheet = f"{nom}_{used_names[nom]}"
+            if nom in used:
+                used[nom] += 1
+                sheet = f"{nom}_{used[nom]}"
             else:
-                used_names[nom] = 1
-                nom_sheet = nom
+                used[nom] = 1
+                sheet = nom
 
-            nom_sheet = safe_sheet_name(nom_sheet)
+            sheet = safe_name(sheet)
 
-            final_df = pd.DataFrame(g["rows"], columns=g["header"])
-            final_df.to_excel(writer, sheet_name=nom_sheet, index=False)
+            df_final = pd.DataFrame(g["rows"], columns=g["header"])
+            df_final.to_excel(writer, sheet_name=sheet, index=False)
 
-            ws = writer.book[nom_sheet]
+            ws = writer.book[sheet]
             ws.freeze_panes = "A2"
             ws.auto_filter.ref = ws.dimensions
 
             for col in ws.columns:
-                max_len = max(len(str(cell.value)) if cell.value else 0 for cell in col)
+                max_len = max(len(str(c.value)) if c.value else 0 for c in col)
                 ws.column_dimensions[col[0].column_letter].width = min(max_len + 3, 35)
 
     output.seek(0)
 
-    st.success(f"{len(groupes)} tableaux homogènes fusionnés.")
+    st.success(f"{len(groupes)} tableaux fusionnés")
 
     st.download_button(
         "Télécharger Excel",
