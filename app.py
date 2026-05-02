@@ -1,84 +1,150 @@
 import streamlit as st
-import pdfplumber
-from openpyxl import Workbook
-from openpyxl.styles import Border, Side, Font, PatternFill, Alignment
+import camelot
+import pandas as pd
 from io import BytesIO
+import tempfile
+import os
+import re
 
-st.title("Extraction simple des tableaux PDF vers Excel")
+st.title("Extraction tableaux PDF géotechnique")
 
 pdf_file = st.file_uploader("Importer le PDF", type=["pdf"])
 
-def clean(v):
-    if v is None:
+def clean_cell(x):
+    if pd.isna(x):
         return ""
-    return str(v).replace("\n", " ").strip()
+    return str(x).replace("\n", " ").strip()
 
-def style(ws):
-    thin = Border(
-        left=Side(style="thin"),
-        right=Side(style="thin"),
-        top=Side(style="thin"),
-        bottom=Side(style="thin")
-    )
+def clean_df(df):
+    df = df.applymap(clean_cell)
+    df = df.dropna(how="all")
+    df = df.loc[:, ~(df == "").all()]
+    return df.reset_index(drop=True)
 
-    header_fill = PatternFill("solid", fgColor="9DC3E6")
+def get_header(df):
+    # cherche la première ligne qui ressemble à un header
+    for i in range(min(4, len(df))):
+        txt = " ".join(df.iloc[i].astype(str)).lower()
+        if any(w in txt for w in ["sondage", "profondeur", "pression", "module", "résistance", "resistance", "coord"]):
+            return i
+    return 0
 
-    for row in ws.iter_rows():
-        for cell in row:
-            cell.border = thin
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+def normalize_header(header):
+    txt = " ".join([str(x).lower().strip() for x in header])
+    txt = re.sub(r"\s+", " ", txt)
+    return txt
 
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-        cell.fill = header_fill
+def safe_sheet_name(name):
+    name = re.sub(r"[\[\]\:\*\?\/\\]", "_", name)
+    return name[:31]
 
-    for col in ws.columns:
-        max_len = 0
-        for cell in col:
-            if cell.value:
-                max_len = max(max_len, len(str(cell.value)))
-        ws.column_dimensions[col[0].column_letter].width = min(max_len + 3, 35)
+def detect_name(header_text):
+    h = header_text.lower()
+
+    if "pression" in h or "pressio" in h or "module pressiom" in h:
+        return "Pressiometrique"
+    if "compression" in h or "résistance" in h or "resistance" in h:
+        return "Compression_simple"
+    if "coord" in h or (" x " in h and " y " in h):
+        return "Coordonnees"
+    if "lithologie" in h or "formation" in h:
+        return "Lithologie"
+
+    return "Tableau"
 
 if pdf_file:
-    wb = Workbook()
-    wb.remove(wb.active)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_file.read())
+        pdf_path = tmp.name
 
-    compteur = 1
+    st.info("Extraction en cours...")
 
-    table_settings = {
-        "vertical_strategy": "lines",
-        "horizontal_strategy": "lines",
-        "snap_tolerance": 3,
-        "join_tolerance": 3,
-        "intersection_tolerance": 5,
-        "text_tolerance": 2,
-    }
+    tables = camelot.read_pdf(
+        pdf_path,
+        pages="all",
+        flavor="lattice"
+    )
 
-    with pdfplumber.open(pdf_file) as pdf:
-        for page_num, page in enumerate(pdf.pages, start=1):
+    groupes = {}
 
-            tables = page.extract_tables(table_settings)
+    for table in tables:
+        df = clean_df(table.df)
 
-            for table in tables:
-                if table and len(table) > 1:
-                    ws = wb.create_sheet(f"Tableau_{compteur}")
+        if df.empty or len(df) < 2:
+            continue
 
-                    for i, row in enumerate(table, start=1):
-                        for j, val in enumerate(row, start=1):
-                            ws.cell(row=i, column=j).value = clean(val)
+        header_index = get_header(df)
+        header = list(df.iloc[header_index])
+        data = df.iloc[header_index + 1:].copy()
 
-                    style(ws)
-                    compteur += 1
+        # supprimer les répétitions du header dans les pages suivantes
+        header_norm = normalize_header(header)
+        rows_clean = []
+
+        for _, row in data.iterrows():
+            row_list = list(row)
+            row_norm = normalize_header(row_list)
+
+            if row_norm == header_norm:
+                continue
+
+            if all(str(x).strip() == "" for x in row_list):
+                continue
+
+            rows_clean.append(row_list)
+
+        if not rows_clean:
+            continue
+
+        key = f"{len(header)}__{header_norm}"
+        nom_base = detect_name(header_norm)
+
+        if key not in groupes:
+            groupes[key] = {
+                "nom": nom_base,
+                "header": header,
+                "rows": []
+            }
+
+        groupes[key]["rows"]..extend(rows_clean)
 
     output = BytesIO()
-    wb.save(output)
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        used_names = {}
+
+        for key, g in groupes.items():
+            nom = g["nom"]
+
+            if nom in used_names:
+                used_names[nom] += 1
+                nom_sheet = f"{nom}_{used_names[nom]}"
+            else:
+                used_names[nom] = 1
+                nom_sheet = nom
+
+            nom_sheet = safe_sheet_name(nom_sheet)
+
+            final_df = pd.DataFrame(g["rows"], columns=g["header"])
+            final_df.to_excel(writer, sheet_name=nom_sheet, index=False)
+
+            ws = writer.book[nom_sheet]
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+
+            for col in ws.columns:
+                max_len = max(len(str(cell.value)) if cell.value else 0 for cell in col)
+                ws.column_dimensions[col[0].column_letter].width = min(max_len + 3, 35)
+
     output.seek(0)
 
-    st.success(f"{compteur - 1} tableaux extraits.")
+    st.success(f"{len(groupes)} tableaux homogènes fusionnés.")
 
     st.download_button(
         "Télécharger Excel",
         data=output,
-        file_name="tableaux_copie_colle.xlsx",
+        file_name="tableaux_fusionnes.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
+    os.remove(pdf_path)
