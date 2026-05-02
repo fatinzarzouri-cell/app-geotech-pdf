@@ -1,3 +1,4 @@
 streamlit
-pdfplumber
+camelot-py[cv]
+pandas
 openpyxl
